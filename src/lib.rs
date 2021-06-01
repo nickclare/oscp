@@ -1,160 +1,229 @@
 #![no_std]
 
-use core::convert::TryFrom;
+use core::{
+    convert::{Infallible, TryFrom},
+    hash::Hasher,
+};
 
+use bitflags::bitflags;
+use crc::crc32;
 use embedded_hal::serial::{Read, Write};
 use heapless as h;
-use packet::*;
-
-pub(crate) mod packet;
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-/// An OSCP device address. The controller should always have address 1. Peripheral devices
-/// can have any other non-zero address. Address 0 is used to denote a broadcast message.
-pub struct Addr(u8);
-pub enum Command {
-    Reset,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum State {
-    Ready,
-
-    Waiting,
-}
-
-/// Maximum packet length.
-/// Currently set to 19 bytes, which is the 3-byte header, and then a maximum of 16 data bytes.
-pub const MAX_LENGTH: usize = 19;
-
-pub struct Oscp<READ, WRITE> {
-    read: READ,
-    write: WRITE,
-    address: Addr,
-    state: State,
-    read_buffer: h::Vec<u8, MAX_LENGTH>,
-}
 
 pub enum Error {
-    NotReady,
     IoError,
     ParseError,
-    General,
 }
 
-pub type Result<T> = core::result::Result<T, Error>;
+/// Packet containing data of type `D`. In general, D should implement Encode and Decode
+pub struct Packet<D> {
+    typ: PacketType,
+    flags: Flags,
+    target: Addr,
+    data: D,
+}
 
-impl<READ, WRITE> Oscp<READ, WRITE> {
-    pub fn peripheral(read: READ, write: WRITE, address: Addr) -> Self
-    where
-        READ: Read<u8>,
-        WRITE: Write<u8>,
-    {
-        Self {
-            read,
-            write,
-            address,
-            state: State::Waiting,
-            read_buffer: h::Vec::new(),
-        }
-    }
-
-    pub fn controller(read: READ, write: WRITE) -> Self
-    where
-        READ: Read<u8>,
-        WRITE: Write<u8>,
-    {
-        Self {
-            read,
-            write,
-            address: Addr(1),
-            state: State::Ready,
-            read_buffer: h::Vec::new(),
-        }
+bitflags! {
+    struct Flags: u8 {
+        const IGNORE = 0b00000001;
     }
 }
 
-impl<READ, WRITE> Oscp<READ, WRITE>
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Addr(u8);
+
+pub const CONTROLLER: Addr = Addr(0);
+pub const BROADCAST: Addr = Addr(255);
+
+pub type CRC = u32; // For now.
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum PacketType {
+    Command = 0x01,
+    MidiEvent = 0x02,
+
+    Raw = 0xFF, // not really useful on its own
+}
+
+impl TryFrom<u8> for PacketType {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(PacketType::Command),
+            0x02 => Ok(PacketType::MidiEvent),
+            0xFF => Ok(PacketType::Raw),
+            _ => Err(Error::ParseError),
+        }
+    }
+}
+
+/// Each packet contains 32 data bytes.
+const PACKET_LEN: usize = 32;
+
+type Raw = h::Vec<u8, PACKET_LEN>;
+
+pub trait Encode {
+    fn data(&self) -> Raw;
+}
+
+pub trait Decode: Sized {
+    type Error;
+    fn decode(raw: Raw) -> Result<Self, Self::Error>;
+}
+
+impl Encode for Raw {
+    fn data(&self) -> Raw {
+        self.clone()
+    }
+}
+
+impl Decode for Raw {
+    type Error = Infallible;
+    fn decode(raw: Raw) -> Result<Self, Self::Error> {
+        Ok(raw)
+    }
+}
+
+impl<D> Packet<D>
 where
-    READ: Read<u8>,
-    WRITE: Write<u8>,
+    D: Encode + Decode,
 {
-    pub fn send_command(&mut self, dest: Addr, _cmd: Command) -> Result<()> {
-        let packet = Packet {
-            dest,
-            packet_type: Type::Command,
-        };
-        self.send_packet(&packet)
+    pub fn write(&self, s: impl Write<u8>) -> Result<(), Error> {
+        self.encoded().write_raw(s)
     }
 
-    /// Send a generic `Packet`. No error checking is done on whether the packet is valid,
-    /// however it should be (close to) impossible for a user to create an invalid packet.
-    pub fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.state != State::Ready {
-            Err(Error::NotReady)
-        } else {
-            packet.write(&mut self.write)?;
+    pub fn with_data<F>(&self, data: F) -> Packet<F> {
+        Packet {
+            typ: self.typ,
+            flags: self.flags,
+            target: self.target,
+            data,
+        }
+    }
+
+    pub fn encoded(&self) -> Packet<Raw> {
+        let d = self.data.data();
+        self.with_data(d)
+    }
+}
+
+impl Packet<Raw> {
+    /// Write out a raw packet to the stream
+    pub fn write_raw(&mut self, s: impl Write<u8>) -> Result<(), Error> {
+        let mut out = DigesterOutput::new(s);
+        out.write(self.typ as u8)?;
+        out.write(self.flags.bits())?;
+        out.write(self.target.0)?;
+        out.write_data(self.data.as_ref())?;
+        out.write_checksum()?;
+
+        Ok(())
+    }
+
+    /// Read in a raw packet
+    pub fn read_raw(s: impl Read<u8>) -> Result<Self, Error> {
+        let mut input = DigesterInput::new(s);
+        let packet_type = PacketType::try_from(input.read()?)?;
+        let flags = Flags::from_bits(input.read()?).ok_or(Error::ParseError)?;
+        let target = Addr(input.read()?);
+        let mut data: [u8; PACKET_LEN] = Default::default();
+        input.read_data(&mut data)?;
+        input.read_checksum()?;
+        let data = h::Vec::from_slice(&data).map_err(|_| Error::ParseError)?;
+
+        Ok(Packet {
+            typ: packet_type,
+            flags,
+            target,
+            data,
+        })
+    }
+}
+
+/// Writes data to a serial device, and calculates the CRC32 checksum as data is written
+struct DigesterOutput<O> {
+    output: O,
+    digest: crc32::Digest,
+}
+
+impl<O: Write<u8>> DigesterOutput<O> {
+    fn new(output: O) -> Self {
+        let digest = crc32::Digest::new(crc32::IEEE);
+        Self { output, digest }
+    }
+
+    /// Write a single byte
+    fn write(&mut self, d: u8) -> Result<(), Error> {
+        self.output.write(d).map_err(to_io_error)?;
+        self.digest.write_u8(d);
+        Ok(())
+    }
+
+    /// Write a number of bytes from a buffer.
+    fn write_data(&mut self, d: &[u8]) -> Result<(), Error> {
+        for b in d {
+            self.write(*b)?;
+        }
+        Ok(())
+    }
+
+    /// Write out the calculated checksum, and return it.
+    fn write_checksum(&mut self) -> Result<CRC, Error> {
+        let digest = self.digest.finish() as u32;
+        for b in &digest.to_le_bytes() {
+            self.output.write(*b).map_err(to_io_error)?;
+        }
+        Ok(digest)
+    }
+}
+
+/// Reads data from a serial device, and cumulatively calculates the CRC32 checksum
+struct DigesterInput<I> {
+    input: I,
+    digest: crc32::Digest,
+}
+
+impl<I: Read<u8>> DigesterInput<I> {
+    fn new(input: I) -> Self {
+        let digest = crc32::Digest::new(crc32::IEEE);
+        Self { input, digest }
+    }
+
+    /// Read a single byte
+    fn read(&mut self) -> Result<u8, Error> {
+        let d = self.input.read().map_err(to_io_error)?;
+        self.digest.write_u8(d);
+
+        Ok(d)
+    }
+
+    /// Read `LEN` bytes into a buffer
+    fn read_data<const LEN: usize>(&mut self, buf: &mut [u8; LEN]) -> Result<(), Error> {
+        for i in 0..LEN {
+            buf[i] = self.read()?;
+        }
+        Ok(())
+    }
+
+    /// Read the checksum from the stream, and compare it to the calculated checksum
+    fn read_checksum(&mut self) -> Result<(), Error> {
+        let mut buf: [u8; 4] = Default::default();
+        for i in 0..4 {
+            buf[i] = self.input.read().map_err(to_io_error)?;
+        }
+        let packet_checksum = u32::from_le_bytes(buf);
+        let calc_checksum = self.digest.finish() as u32;
+        if packet_checksum == calc_checksum {
             Ok(())
-        }
-    }
-
-    /// Poll the input stream for more data, and return a `Packet` if a full packet has been
-    /// read and is available.
-    pub fn poll(&mut self) -> Result<Option<Packet>> {
-        loop {
-            let byte: nb::Result<u8, _> = self.read.read();
-            match byte {
-                Err(nb::Error::WouldBlock) => return Ok(None),
-                Err(nb::Error::Other(_)) => {
-                    // An IoError has occurred, reset the buffer and return the error
-                    self.reset_read_buffer();
-                    return Err(Error::IoError);
-                }
-                Ok(b) => {
-                    if let Err(_) = self.read_buffer.push(b) {
-                        panic!("Maximum packet length exceeded");
-                    }
-                    if let Some(packet) = self.parse_packet()? {
-                        self.reset_read_buffer();
-                        return Ok(Some(packet));
-                    } // else continue loop               }
-                }
-            }
-        }
-    }
-
-    fn parse_packet(&self) -> Result<Option<Packet>> {
-        if self.read_buffer.len() < 3 {
-            Ok(None)
         } else {
-            let addr = self.read_buffer[0];
-            let packet_type = self.read_buffer[1];
-            let len = self.read_buffer[2].into();
-            if self.read_buffer.len() - 3 < len {
-                Ok(None) // packet not yet complete.
-            } else {
-                self.decode_packet(
-                    Addr(addr),
-                    packet::Type::try_from(packet_type)?,
-                    len,
-                    &self.read_buffer[3..],
-                )
-            }
+            Err(Error::IoError)
         }
     }
+}
 
-    fn decode_packet(
-        &self,
-        addr: Addr,
-        typ: packet::Type,
-        len: usize,
-        data: &[u8],
-    ) -> Result<Option<Packet>> {
-        todo!()
-    }
-
-    fn reset_read_buffer(&mut self) {
-        self.read_buffer.clear();
-    }
+fn to_io_error<E>(_err: nb::Error<E>) -> Error {
+    Error::IoError // TODO: return context info along with error
 }

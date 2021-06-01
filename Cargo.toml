@@ -11,6 +11,8 @@ embedded-hal = "0.2"
 nb = "1"
 heapless = "0.7"
 byteorder = "1.4"
+bitflags = "1.2"
+crc = "1.8"
 
 [dev-dependencies]
 linux-embedded-hal = "0.3"
